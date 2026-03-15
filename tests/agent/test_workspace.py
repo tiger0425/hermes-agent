@@ -292,6 +292,7 @@ class TestWorkspaceRetrieval:
         index_workspace_knowledgebase(cfg)
         context = workspace_context_for_turn("summarize the deployment plan", config=cfg)
         assert "workspace context was retrieved for this turn only" in context.lower()
+        assert "[source: relative/path]" in context.lower()
         assert "docs/plan.md" in context
 
         cfg["knowledgebase"]["retrieval_mode"] = "gated"

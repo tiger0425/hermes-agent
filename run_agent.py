@@ -1826,6 +1826,10 @@ class AIAgent:
             tool_guidance.append(MEMORY_GUIDANCE)
         if "session_search" in self.valid_tool_names:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+        if "workspace" in self.valid_tool_names:
+            tool_guidance.append(
+                "When you answer from workspace retrieval or workspace tool results, cite files inline as [Source: relative/path]."
+            )
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
         if tool_guidance:

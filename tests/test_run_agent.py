@@ -566,8 +566,18 @@ class TestBuildSystemPrompt:
 
     def test_includes_datetime(self, agent):
         prompt = agent._build_system_prompt()
-        # Should contain current date info like "Conversation started:"
+        # Should contain current date info like "Conversation started:"}
         assert "Conversation started:" in prompt
+
+    def test_workspace_tool_adds_citation_guidance(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search", "workspace")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(api_key="test", quiet_mode=True, skip_context_files=True, skip_memory=True)
+        prompt = agent._build_system_prompt()
+        assert "[Source: relative/path]" in prompt
 
 
 class TestInvalidateSystemPrompt:

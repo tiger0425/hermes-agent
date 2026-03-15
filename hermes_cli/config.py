@@ -532,6 +532,38 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
+    "GEMINI_API_KEY": {
+        "description": "Google Gemini API key for hosted workspace embeddings",
+        "prompt": "Google Gemini API key",
+        "url": "https://ai.google.dev/",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
+    "GOOGLE_API_KEY": {
+        "description": "Alias for GEMINI_API_KEY for Google-hosted workspace embeddings",
+        "prompt": "Google API key",
+        "url": "https://ai.google.dev/",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
+    "COHERE_API_KEY": {
+        "description": "Cohere API key for optional workspace reranking",
+        "prompt": "Cohere API key",
+        "url": "https://dashboard.cohere.com/api-keys",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
+    "VOYAGE_API_KEY": {
+        "description": "Voyage AI API key for optional workspace reranking",
+        "prompt": "Voyage AI API key",
+        "url": "https://dash.voyageai.com/",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
 
     # ── Honcho ──
     "HONCHO_API_KEY": {
