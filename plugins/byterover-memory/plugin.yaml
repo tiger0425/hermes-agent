@@ -1,0 +1,5 @@
+name: byterover-memory
+version: 1.0.0
+description: "ByteRover persistent memory — hierarchical knowledge tree with tiered retrieval via the brv CLI."
+hooks:
+  - on_pre_compress
