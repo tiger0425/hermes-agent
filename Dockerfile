@@ -25,10 +25,13 @@ COPY . /opt/hermes
 WORKDIR /opt/hermes
 
 # Install Node dependencies and Playwright as root (--with-deps needs apt)
-RUN npm install --prefer-offline --no-audit && \
-    npx playwright install --with-deps chromium --only-shell && \
+RUN npm config set fetch-retries 5 && \
+    npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    for i in 1 2 3; do rm -rf /opt/hermes/node_modules && npm install --prefer-offline --no-audit && break || { if [ "$i" -eq 3 ]; then exit 1; fi; echo "retry npm install $i"; rm -rf /opt/hermes/node_modules; sleep 15; }; done && \
+    for i in 1 2 3; do npx playwright install --with-deps chromium --only-shell && break || { if [ "$i" -eq 3 ]; then exit 1; fi; echo "retry playwright install $i"; sleep 15; }; done && \
     cd /opt/hermes/scripts/whatsapp-bridge && \
-    npm install --prefer-offline --no-audit && \
+    for i in 1 2 3; do rm -rf /opt/hermes/scripts/whatsapp-bridge/node_modules && npm install --prefer-offline --no-audit && break || { if [ "$i" -eq 3 ]; then exit 1; fi; echo "retry whatsapp-bridge npm install $i"; rm -rf /opt/hermes/scripts/whatsapp-bridge/node_modules; sleep 15; }; done && \
     npm cache clean --force
 
 # Hand ownership to hermes user, then install Python deps in a virtualenv
@@ -39,7 +42,7 @@ RUN uv venv && \
     uv pip install --no-cache-dir -e ".[all]"
 
 USER root
-RUN chmod +x /opt/hermes/docker/entrypoint.sh
+RUN sed -i 's/\r$//' /opt/hermes/docker/entrypoint.sh && chmod +x /opt/hermes/docker/entrypoint.sh
 
 ENV HERMES_HOME=/opt/data
 VOLUME [ "/opt/data" ]
