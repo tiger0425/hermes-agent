@@ -1091,6 +1091,21 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    async def send_clarify_prompt(
+        self,
+        chat_id: str,
+        question: str,
+        choices: list[str],
+        clarify_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a multiple-choice clarify prompt when the platform supports it.
+
+        Platforms without rich interaction can keep the default text fallback by
+        returning ``success=False``.
+        """
+        return SendResult(success=False, error="Not supported")
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.
