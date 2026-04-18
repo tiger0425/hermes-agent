@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import sys
@@ -25,7 +26,8 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from contextvars import copy_context
+import uuid
+from contextvars import ContextVar, Token, copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
@@ -340,6 +342,186 @@ logger = logging.getLogger(__name__)
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+_FORMAL_RELEASE_BINDING_KEYS = (
+    "tenant_id",
+    "task_id",
+    "session_id",
+    "correlation_id",
+    "version",
+)
+_clarify_binding_metadata: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "gateway_clarify_binding_metadata",
+    default=None,
+)
+_WEEK9_RELEASE_FREEZE_RECORD_RELATIVE_PATH = (
+    Path("reports") / "week9" / "release-freeze-record.json"
+)
+
+
+def _resolve_week9_release_freeze_record_path() -> Path:
+    """Resolve the Week 9 freeze record across local and container layouts."""
+    candidates = [
+        Path(__file__).resolve().parents[3] / _WEEK9_RELEASE_FREEZE_RECORD_RELATIVE_PATH,
+        Path(__file__).resolve().parents[2] / _WEEK9_RELEASE_FREEZE_RECORD_RELATIVE_PATH,
+        _hermes_home / "workspace" / _WEEK9_RELEASE_FREEZE_RECORD_RELATIVE_PATH,
+        _hermes_home / _WEEK9_RELEASE_FREEZE_RECORD_RELATIVE_PATH,
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        f"Week 9 release freeze record not found in any known location: "
+        + ", ".join(str(path) for path in candidates)
+    )
+
+
+def _normalize_clarify_binding_metadata(binding: Any) -> Optional[Dict[str, Any]]:
+    """Normalize internal clarify binding metadata for gateway-side state."""
+    if not isinstance(binding, dict):
+        return None
+
+    normalized: Dict[str, Any] = {}
+    for key, value in binding.items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            normalized[str(key)] = value
+
+    release_scope = str(normalized.get("release_scope") or "").strip().lower()
+    formal_release = bool(normalized.get("formal_release")) or release_scope in {
+        "formal_release",
+        "week9_formal_release",
+    }
+    if formal_release:
+        normalized["formal_release"] = True
+        normalized["release_scope"] = release_scope or "formal_release"
+        normalized["missing_fields"] = [
+            field
+            for field in _FORMAL_RELEASE_BINDING_KEYS
+            if not str(normalized.get(field) or "").strip()
+        ]
+
+    return normalized or None
+
+
+def set_current_clarify_binding_metadata(
+    binding: Optional[Dict[str, Any]],
+) -> Token[Optional[Dict[str, Any]]]:
+    """Bind internal clarify metadata to the current gateway/agent context."""
+    return _clarify_binding_metadata.set(_normalize_clarify_binding_metadata(binding))
+
+
+def reset_current_clarify_binding_metadata(
+    token: Token[Optional[Dict[str, Any]]],
+) -> None:
+    """Restore the prior clarify binding metadata context."""
+    _clarify_binding_metadata.reset(token)
+
+
+def get_current_clarify_binding_metadata() -> Optional[Dict[str, Any]]:
+    """Return the current gateway-side clarify binding metadata, if any."""
+    binding = _clarify_binding_metadata.get()
+    return dict(binding) if isinstance(binding, dict) else None
+
+
+def _load_week9_formal_release_binding_metadata() -> Dict[str, Any]:
+    """Load frozen Week 9 formal-release coordinates for gateway clarify binding."""
+    freeze_record_path = _resolve_week9_release_freeze_record_path()
+    with open(freeze_record_path, encoding="utf-8-sig") as _freeze_file:
+        freeze_record = json.load(_freeze_file) or {}
+
+    evidence_coordinates = freeze_record.get("week9_evidence_coordinates")
+    if not isinstance(evidence_coordinates, dict):
+        evidence_coordinates = freeze_record.get("evidence") or {}
+    if not isinstance(evidence_coordinates, dict):
+        evidence_coordinates = {}
+
+    binding = _normalize_clarify_binding_metadata(
+        {
+            "formal_release": True,
+            "release_scope": "week9_formal_release",
+            "authorization_channel": freeze_record.get("authorization_channel"),
+            "decision_stage": freeze_record.get("decision_stage"),
+            **evidence_coordinates,
+        }
+    )
+    if not isinstance(binding, dict):
+        raise RuntimeError("Week 9 release freeze metadata is unavailable.")
+
+    missing_fields = [str(field) for field in (binding.get("missing_fields") or []) if str(field).strip()]
+    if missing_fields:
+        raise RuntimeError(
+            "Week 9 release freeze metadata is incomplete: "
+            + ", ".join(missing_fields)
+            + "."
+        )
+    return binding
+
+
+def _build_week9_formal_release_initiator_message() -> str:
+    """Build the internal gateway-only initiator prompt for Week 9 release approval."""
+    return (
+        "[System note: This gateway-only turn initiates the Week 9 formal release approval flow. "
+        "The release subject is the Hermes Week 9 formal release governance flow for the Hermes acceptance runtime on Win11 + Docker; this is not a production release. "
+        "The authorization channel is Feishu. The frozen ownership boundary includes rollback_authority=noah and oncall_owner=noah. "
+        "The approval record must stay bound to tenant_id=tenant-demo-acme, task_id=task-week2-demo-001, session_id=session-week2-demo-001, correlation_id=corr-week2-demo-001, version=0.2.0. "
+        "The required output namespace is artifacts/week9/hermes-runtime/, artifacts/week9/release-approval/<tenant_id>/<correlation_id>/<version>/..., and reports/week9/*.json. "
+        "Do not ask the user what Week 9 refers to. "
+        "Use the normal clarify mechanism immediately to request an explicit approve-or-deny decision for this Week 9 formal release flow. "
+        "Keep user-facing wording concise and truthful. "
+        "Do not claim release approval, production readiness, or deployment completion unless the user explicitly confirms it.]\n\n"
+        "Initiate the Week 9 formal release approval flow and collect an explicit approve-or-deny decision."
+    )
+
+
+def _build_week9_formal_release_question() -> tuple[str, List[str]]:
+    """Return the forced clarify prompt for Week 9 formal release approval."""
+    return (
+        "**Week 9 Formal Release Approval — Hermes Runtime (Win11 + Docker)**\n\n"
+        "This is a **non-production acceptance release** only.\n\n"
+        "**Release metadata:**\n"
+        "- **Tenant:** tenant-demo-acme\n"
+        "- **Task:** task-week2-demo-001\n"
+        "- **Session:** session-week2-demo-001\n"
+        "- **Correlation ID:** corr-week2-demo-001\n"
+        "- **Version:** 0.2.0\n"
+        "- **Ownership boundary:** rollback_authority=noah, oncall_owner=noah\n\n"
+        "**Proposed artifact paths:**\n"
+        "- `artifacts/week9/hermes-runtime/`\n"
+        "- `artifacts/week9/release-approval/tenant-demo-acme/corr-week2-demo-001/0.2.0/`\n"
+        "- `reports/week9/*.json`\n\n"
+        "**Do you approve or deny this Week 9 formal release?**",
+        [
+            "✅ Approve — proceed with Week 9 release",
+            "❌ Deny — reject Week 9 release",
+            "⏸️ Hold — defer to a later decision",
+        ],
+    )
+
+
+def _extract_slash_command_word(text: Optional[str]) -> Optional[str]:
+    """Extract a normalized slash-command word from raw message text."""
+    stripped = str(text or "").strip()
+    if not stripped.startswith("/"):
+        return None
+    command_word = stripped[1:].split(None, 1)[0].strip().lower()
+    if not command_word:
+        return None
+    return command_word.replace("_", "-")
+
+
+def _resolve_gateway_only_command(
+    command: Optional[str],
+) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Resolve gateway-only hidden commands into message overrides + binding."""
+    normalized = str(command or "").strip().lower().replace("_", "-")
+    if normalized != "formal-release":
+        return None, None
+    return (
+        _build_week9_formal_release_initiator_message(),
+        _load_week9_formal_release_binding_metadata(),
+    )
+
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
@@ -646,6 +828,10 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+        # Track pending clarify prompts per session so gateway platforms can
+        # answer agent-issued business questions while the agent thread blocks.
+        self._pending_clarify: Dict[str, Dict[str, Any]] = {}
+        self._clarify_resolution_state: Dict[str, Dict[str, Any]] = {}
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -1388,6 +1574,201 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    @staticmethod
+    def _clarify_timeout_response() -> str:
+        return (
+            "The user did not provide a response within the time limit. "
+            "Use your best judgement to make the choice and proceed."
+        )
+
+    @staticmethod
+    def _clarify_cancel_response(reason: str) -> str:
+        return (
+            "The pending clarify prompt was cancelled because "
+            f"{reason}. Stop and wait for a fresh user instruction before proceeding."
+        )
+
+    @staticmethod
+    def _is_fail_closed_clarify_binding(binding_metadata: Any) -> bool:
+        return isinstance(binding_metadata, dict) and bool(binding_metadata.get("formal_release"))
+
+    def _build_pending_clarify_state(
+        self,
+        *,
+        clarify_id: str,
+        question: str,
+        choices: List[str],
+        response_queue: queue.Queue[str],
+        created_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        binding_metadata = get_current_clarify_binding_metadata()
+        return {
+            "clarify_id": clarify_id,
+            "question": question,
+            "choices": list(choices),
+            "response_queue": response_queue,
+            "created_at": time.time() if created_at is None else float(created_at),
+            "binding_metadata": binding_metadata,
+            "fail_closed_ready": self._is_fail_closed_clarify_binding(binding_metadata),
+            "last_invalid_attempt": None,
+        }
+
+    def _get_clarify_resolution_store(self) -> Dict[str, Dict[str, Any]]:
+        store = getattr(self, "_clarify_resolution_state", None)
+        if isinstance(store, dict):
+            return store
+        store = {}
+        self._clarify_resolution_state = store
+        return store
+
+    def _record_clarify_resolution(
+        self,
+        session_key: str,
+        pending: Dict[str, Any],
+        *,
+        response: str,
+        outcome: str,
+    ) -> None:
+        binding_metadata = pending.get("binding_metadata")
+        fail_closed_ready = bool(
+            pending.get("fail_closed_ready")
+            or self._is_fail_closed_clarify_binding(binding_metadata)
+        )
+        fail_closed_reason = outcome if fail_closed_ready and outcome != "answered" else None
+        self._get_clarify_resolution_store()[session_key] = {
+            "clarify_id": str(pending.get("clarify_id") or ""),
+            "question": str(pending.get("question") or ""),
+            "response": response,
+            "outcome": outcome,
+            "resolved_at": time.time(),
+            "binding_metadata": dict(binding_metadata) if isinstance(binding_metadata, dict) else None,
+            "fail_closed_ready": fail_closed_ready,
+            "fail_closed_reason": fail_closed_reason,
+            "last_invalid_attempt": pending.get("last_invalid_attempt"),
+        }
+
+    def _mark_pending_clarify_invalid(
+        self,
+        pending: Dict[str, Any],
+        *,
+        reason: str,
+    ) -> None:
+        pending["last_invalid_attempt"] = {
+            "reason": reason,
+            "at": time.time(),
+            "fail_closed_ready": bool(
+                pending.get("fail_closed_ready")
+                or self._is_fail_closed_clarify_binding(pending.get("binding_metadata"))
+            ),
+        }
+
+    def _extract_pending_clarify_response(
+        self,
+        pending: Dict[str, Any],
+        event: MessageEvent,
+    ) -> Optional[str]:
+        """Parse a user response for a pending clarify prompt."""
+        choices = [str(c) for c in (pending.get("choices") or []) if str(c).strip()]
+        command = event.get_command()
+
+        if command == "card":
+            raw_args = (event.get_command_args() or "").strip()
+            action_tag, _, payload_text = raw_args.partition(" ")
+            if action_tag != "button" or not payload_text:
+                return None
+            try:
+                payload = json.loads(payload_text)
+            except Exception:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            clarify_id = str(payload.get("clarify_id") or "").strip()
+            if clarify_id != str(pending.get("clarify_id") or "").strip():
+                self._mark_pending_clarify_invalid(pending, reason="clarify_id_mismatch")
+                return None
+            choice = str(payload.get("clarify_choice") or "").strip()
+            if choices and not any(choice.casefold() == existing.casefold() for existing in choices):
+                self._mark_pending_clarify_invalid(pending, reason="invalid_choice")
+                return None
+            return choice or None
+
+        text = (event.text or "").strip()
+        if not text or event.is_command():
+            return None
+
+        if not choices:
+            return text
+
+        if text.isdigit():
+            idx = int(text) - 1
+            if 0 <= idx < len(choices):
+                return choices[idx]
+
+        lowered = text.casefold()
+        for choice in choices:
+            if lowered == choice.casefold():
+                return choice
+
+        return text
+
+    def _resolve_pending_clarify(
+        self,
+        session_key: str,
+        response: str,
+        outcome: str = "answered",
+    ) -> bool:
+        """Deliver a response to the waiting clarify callback for *session_key*."""
+        pending = self._pending_clarify.pop(session_key, None)
+        if not pending:
+            return False
+        self._record_clarify_resolution(
+            session_key,
+            pending,
+            response=response,
+            outcome=outcome,
+        )
+        response_queue = pending.get("response_queue")
+        if response_queue is not None:
+            try:
+                response_queue.put_nowait(response)
+            except Exception:
+                logger.debug(
+                    "Failed to deliver clarify response for %s",
+                    session_key[:30],
+                    exc_info=True,
+                )
+        logger.info(
+            "Resolved clarify prompt for session %s with outcome=%s response=%r",
+            session_key[:30],
+            outcome,
+            response[:120],
+        )
+        return True
+
+    def _cancel_pending_clarify(self, session_key: str, reason: str) -> bool:
+        """Cancel a pending clarify prompt for *session_key* if one exists."""
+        return self._resolve_pending_clarify(
+            session_key,
+            self._clarify_cancel_response(reason),
+            outcome="cancelled",
+        )
+
+    def _consume_pending_clarify(self, event: MessageEvent, session_key: str) -> bool:
+        pending_session_key = session_key
+        event_metadata = getattr(event, "metadata", None)
+        if isinstance(event_metadata, dict):
+            explicit_session_key = str(event_metadata.get("session_key") or "").strip()
+            if explicit_session_key:
+                pending_session_key = explicit_session_key
+
+        pending = self._pending_clarify.get(pending_session_key)
+        if not pending:
+            return False
+        response = self._extract_pending_clarify_response(pending, event)
+        if response is None:
+            return False
+        return self._resolve_pending_clarify(pending_session_key, response)
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -1517,6 +1898,7 @@ class GatewayRunner:
 
     def _interrupt_running_agents(self, reason: str) -> None:
         for session_key, agent in list(self._running_agents.items()):
+            self._cancel_pending_clarify(session_key, reason)
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             try:
@@ -2409,6 +2791,8 @@ class GatewayRunner:
             self.adapters.clear()
             self._running_agents.clear()
             self._running_agents_ts.clear()
+            self._pending_clarify.clear()
+            self._get_clarify_resolution_store().clear()
             self._pending_messages.clear()
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
@@ -2577,7 +2961,9 @@ class GatewayRunner:
             if not check_feishu_requirements():
                 logger.warning("Feishu: lark-oapi not installed or FEISHU_APP_ID/SECRET not set")
                 return None
-            return FeishuAdapter(config)
+            adapter = FeishuAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WECOM_CALLBACK:
             from gateway.platforms.wecom_callback import (
@@ -2971,6 +3357,10 @@ class GatewayRunner:
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
                     running_agent.interrupt("Stop requested")
+                self._cancel_pending_clarify(
+                    _quick_key,
+                    "the user stopped the current session",
+                )
                 # Force-clean: remove the session lock regardless of agent state
                 adapter = self.adapters.get(source.platform)
                 if adapter and hasattr(adapter, 'get_pending_message'):
@@ -2991,6 +3381,10 @@ class GatewayRunner:
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
                     running_agent.interrupt("Session reset requested")
+                self._cancel_pending_clarify(
+                    _quick_key,
+                    "the user reset the session",
+                )
                 # Clear any pending messages so the old text doesn't replay
                 adapter = self.adapters.get(source.platform)
                 if adapter and hasattr(adapter, 'get_pending_message'):
@@ -3054,6 +3448,15 @@ class GatewayRunner:
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
+
+            if self._consume_pending_clarify(event, _quick_key):
+                return None
+
+            if self._pending_clarify.get(_quick_key):
+                return (
+                    "A decision is waiting for your reply. Tap one of the card buttons, "
+                    "or reply with the option number/text to continue."
+                )
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
@@ -3125,6 +3528,17 @@ class GatewayRunner:
 
         # Check for commands
         command = event.get_command()
+        _clarify_binding_metadata: Optional[Dict[str, Any]] = None
+
+        if command:
+            try:
+                _message_override, _clarify_binding_metadata = _resolve_gateway_only_command(command)
+                if _message_override is not None:
+                    event.text = _message_override
+                    command = None
+            except Exception as e:
+                logger.warning("Failed to prepare Week 9 formal release initiator: %s", e)
+                return str(e)
         
         # Emit command:* hook for any recognized slash command.
         # GATEWAY_KNOWN_COMMANDS is derived from the central COMMAND_REGISTRY
@@ -3405,7 +3819,12 @@ class GatewayRunner:
         self._running_agents_ts[_quick_key] = time.time()
 
         try:
-            return await self._handle_message_with_agent(event, source, _quick_key)
+            return await self._handle_message_with_agent(
+                event,
+                source,
+                _quick_key,
+                clarify_binding_metadata=_clarify_binding_metadata,
+            )
         finally:
             # If _run_agent replaced the sentinel with a real agent and
             # then cleaned it up, this is a no-op.  If we exited early
@@ -3576,7 +3995,14 @@ class GatewayRunner:
 
         return message_text
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str):
+    async def _handle_message_with_agent(
+        self,
+        event,
+        source,
+        _quick_key: str,
+        *,
+        clarify_binding_metadata: Optional[Dict[str, Any]] = None,
+    ):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -4053,6 +4479,7 @@ class GatewayRunner:
                 session_key=session_key,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                clarify_binding_metadata=clarify_binding_metadata,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8603,6 +9030,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        clarify_binding_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -8920,7 +9348,9 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _status_thread_metadata = {"session_key": session_key or ""}
+        if _progress_thread_id:
+            _status_thread_metadata["thread_id"] = _progress_thread_id
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
@@ -9154,6 +9584,7 @@ class GatewayRunner:
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
+            agent.clarify_callback = None
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
@@ -9353,6 +9784,107 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
 
+            def _clarify_callback_sync(question: str, choices: Optional[List[str]]) -> str:
+                timeout_cfg = user_config.get("clarify", {}) if isinstance(user_config, dict) else {}
+                try:
+                    timeout = int(timeout_cfg.get("timeout", 120))
+                except Exception:
+                    timeout = 120
+                timeout = max(1, timeout)
+
+                response_queue: queue.Queue[str] = queue.Queue()
+                clarify_id = uuid.uuid4().hex[:12]
+                clarify_choices = [str(c).strip() for c in (choices or []) if str(c).strip()][:4]
+                self._pending_clarify[_approval_session_key] = self._build_pending_clarify_state(
+                    clarify_id=clarify_id,
+                    question=question,
+                    choices=clarify_choices,
+                    response_queue=response_queue,
+                )
+
+                if _status_adapter:
+                    _status_adapter.pause_typing_for_chat(_status_chat_id)
+
+                def _send_plain_text_prompt() -> None:
+                    if not _status_adapter:
+                        return
+                    lines = [f"❓ {question.strip()}"]
+                    if clarify_choices:
+                        lines.append("")
+                        for idx, choice in enumerate(clarify_choices, 1):
+                            lines.append(f"{idx}. {choice}")
+                        lines.append("")
+                        lines.append("Reply with the option number, the option text, or your own answer.")
+                    else:
+                        lines.append("")
+                        lines.append("Reply with your answer in chat.")
+                    asyncio.run_coroutine_threadsafe(
+                        _status_adapter.send(
+                            _status_chat_id,
+                            "\n".join(lines),
+                            metadata=_status_thread_metadata,
+                        ),
+                        _loop_for_step,
+                    ).result(timeout=15)
+
+                try:
+                    if (
+                        _status_adapter
+                        and clarify_choices
+                        and getattr(type(_status_adapter), "send_clarify_prompt", None) is not None
+                    ):
+                        clarify_result = asyncio.run_coroutine_threadsafe(
+                            _status_adapter.send_clarify_prompt(
+                                chat_id=_status_chat_id,
+                                question=question,
+                                choices=clarify_choices,
+                                clarify_id=clarify_id,
+                                metadata=_status_thread_metadata,
+                            ),
+                            _loop_for_step,
+                        ).result(timeout=15)
+                        if not getattr(clarify_result, "success", False):
+                            logger.warning(
+                                "Interactive clarify send failed, falling back to text: %s",
+                                getattr(clarify_result, "error", None),
+                            )
+                            _send_plain_text_prompt()
+                    else:
+                        _send_plain_text_prompt()
+                except Exception as _clarify_send_error:
+                    logger.warning(
+                        "Clarify prompt send failed, falling back to plain text: %s",
+                        _clarify_send_error,
+                    )
+                    try:
+                        _send_plain_text_prompt()
+                    except Exception as _clarify_plain_error:
+                        logger.error("Failed to send clarify prompt: %s", _clarify_plain_error)
+
+                try:
+                    while True:
+                        try:
+                            return response_queue.get(timeout=1)
+                        except queue.Empty:
+                            pending = self._pending_clarify.get(_approval_session_key)
+                            if not pending or pending.get("clarify_id") != clarify_id:
+                                return self._clarify_cancel_response("the pending question was replaced")
+                            if (time.time() - float(pending.get("created_at", time.time()))) >= timeout:
+                                break
+                    timeout_response = self._clarify_timeout_response()
+                    self._resolve_pending_clarify(
+                        _approval_session_key,
+                        timeout_response,
+                        outcome="timeout",
+                    )
+                    return timeout_response
+                finally:
+                    pending = self._pending_clarify.get(_approval_session_key)
+                    if pending and pending.get("clarify_id") == clarify_id:
+                        self._pending_clarify.pop(_approval_session_key, None)
+                    if _status_adapter:
+                        _status_adapter.resume_typing_for_chat(_status_chat_id)
+
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
             _msn = _pending_notes.pop(session_key, None) if session_key else None
@@ -9376,10 +9908,28 @@ class GatewayRunner:
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
+            _clarify_binding_token = set_current_clarify_binding_metadata(
+                clarify_binding_metadata
+            )
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
+                agent.clarify_callback = _clarify_callback_sync
+                if (
+                    isinstance(clarify_binding_metadata, dict)
+                    and str(clarify_binding_metadata.get("release_scope") or "").strip().lower()
+                    == "week9_formal_release"
+                ):
+                    forced_question, forced_choices = _build_week9_formal_release_question()
+                    forced_decision = _clarify_callback_sync(forced_question, forced_choices)
+                    message = (
+                        "[System note: The required Week 9 formal release decision has already been collected via the gateway clarify flow. "
+                        f"Recorded decision: {forced_decision}]\n\n"
+                        + message
+                    )
                 result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
             finally:
+                self._pending_clarify.pop(_approval_session_key, None)
+                reset_current_clarify_binding_metadata(_clarify_binding_token)
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
@@ -9957,6 +10507,7 @@ class GatewayRunner:
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_clarify_binding_metadata: Optional[Dict[str, Any]] = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     next_message = await self._prepare_inbound_message_text(
@@ -9968,6 +10519,32 @@ class GatewayRunner:
                         return result
                     next_message_id = getattr(pending_event, "message_id", None)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+
+                _pending_gateway_command = _extract_slash_command_word(
+                    getattr(pending_event, "text", None) if pending_event is not None else next_message
+                )
+                if _pending_gateway_command:
+                    try:
+                        _message_override, next_clarify_binding_metadata = _resolve_gateway_only_command(
+                            _pending_gateway_command
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to prepare pending gateway-only command /%s: %s",
+                            _pending_gateway_command,
+                            e,
+                        )
+                        return {
+                            "final_response": str(e),
+                            "messages": updated_history,
+                            "api_calls": result.get("api_calls", 0),
+                            "tools": result.get("tools", []),
+                            "history_offset": len(updated_history),
+                            "failed": True,
+                            "error": str(e),
+                        }
+                    if _message_override is not None:
+                        next_message = _message_override
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -9992,6 +10569,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    clarify_binding_metadata=next_clarify_binding_metadata,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
